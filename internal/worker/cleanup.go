@@ -6,6 +6,8 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/uptrace/bun"
+
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // IdentityExpirer is implemented by IdentityService.SweepExpiredIdentities.
@@ -24,16 +26,20 @@ type IdentityExpirer interface {
 // is idempotent and the DeactivateIfActive claim guarantees only one worker
 // fires the cascade per expired identity.
 type CleanupWorker struct {
-	db       *bun.DB
-	expirer  IdentityExpirer
-	interval time.Duration
+	db              *bun.DB
+	backchannelRepo *postgres.BackchannelRequestRepository
+	expirer         IdentityExpirer
+	interval        time.Duration
 }
 
 // NewCleanupWorker creates a cleanup worker with the given tick interval.
+// backchannelRepo is required so the worker can flip expired CIBA requests
+// to status='expired' (so an in-flight poll sees expired_token before the
+// row is reaped) and then delete the resolved rows.
 // The identity-expiry sweep is wired separately via SetIdentityExpirer
 // after IdentityService is constructed.
-func NewCleanupWorker(db *bun.DB, interval time.Duration) *CleanupWorker {
-	return &CleanupWorker{db: db, interval: interval}
+func NewCleanupWorker(db *bun.DB, backchannelRepo *postgres.BackchannelRequestRepository, interval time.Duration) *CleanupWorker {
+	return &CleanupWorker{db: db, backchannelRepo: backchannelRepo, interval: interval}
 }
 
 // SetIdentityExpirer installs the identity-expiry sweep callback. Nil
@@ -98,6 +104,23 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired auth codes")
 	} else if n, err := authCodeRes.RowsAffected(); err == nil && n > 0 {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired auth codes")
+	}
+
+	// CIBA backchannel requests:
+	//   1. Flip pending → expired so an in-flight poll sees expired_token.
+	//   2. Reap rows in a resolved terminal state past expires_at.
+	// Order matters: sweep first, delete second.
+	if w.backchannelRepo != nil {
+		if n, err := w.backchannelRepo.SweepExpired(ctx, now); err != nil {
+			log.Error().Err(err).Msg("Cleanup: failed to sweep expired backchannel auth requests")
+		} else if n > 0 {
+			log.Info().Int64("count", n).Msg("Cleanup: marked backchannel auth requests expired")
+		}
+		if n, err := w.backchannelRepo.DeleteExpired(ctx, now); err != nil {
+			log.Error().Err(err).Msg("Cleanup: failed to delete expired backchannel auth requests")
+		} else if n > 0 {
+			log.Info().Int64("count", n).Msg("Cleanup: deleted expired backchannel auth requests")
+		}
 	}
 
 	// Identity-expiry sweep. Runs after the row-deletes so that any tokens
